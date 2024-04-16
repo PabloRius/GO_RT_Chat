@@ -1,40 +1,48 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/rs/cors"
 	uuid "github.com/satori/go.uuid"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// ClientManager will keep track of:
 type ClientManager struct {
-	clients    map[*Client]bool // Connected clients
-	broadcast  chan []byte      // Messages broadcasted from and to clients
-	register   chan *Client     // Clients trying to register
-	unregister chan *Client     // Clients trying to unregister
+	clients    	map[string]*Client
+	broadcast  	chan []byte
+	register   	chan *Client
+	unregister 	chan *Client
+	dbClient	*mongo.Client
 }
 
-// A function to send a message to every client, except from the one sending it
-func (manager *ClientManager) send(message []byte, ignore *Client) {
-	for conn := range manager.clients {
-		if conn != ignore {
+func (manager *ClientManager) send(message []byte, recipient string) {
+	if recipient != "" {
+		conn, ok := manager.clients[recipient]
+		if ok {
 			conn.send <- message
 		}
 	}
 }
 
 type Client struct {
-	id     string          // Unique id
-	socket *websocket.Conn // Socket connection
-	send   chan []byte     // Message to be sent
+	id     			string           
+	socket 			*websocket.Conn 
+	send   			chan []byte
+	Username		string
 }
 
-// A function to read the data sont from the clients through the websocket, it then will be added to the manager broadcast
-func (c *Client) read() {
-	defer func() { // If there's any error reading the websocket, the client is assumed disconnected, then deleted from the pool
+func (c *Client) read(manager *ClientManager) {
+	defer func() { 
 		manager.unregister <- c
 		c.socket.Close()
 	}()
@@ -46,12 +54,24 @@ func (c *Client) read() {
 			c.socket.Close()
 			break
 		}
-		jsonMessage, _ := json.Marshal(&Message{Sender: c.id, Content: string(message)})
+		var msg Message
+		err = json.Unmarshal(message, &msg)
+		if err != nil {
+			fmt.Println("Error decoding message: ", err)
+			continue
+		}
+		msg.Sender = c.Username
+		jsonMessage, _ := json.Marshal(&msg)
 		manager.broadcast <- jsonMessage
+
+		err = sendMessageToDB(manager.dbClient, msg)
+		if err != nil {
+			log.Println("Error saving the message to the MongoDB: ", err)
+		}
 	}
 }
 
-// A function for clients to write data into the websocket for the other clients
+// 
 
 func (c *Client) write() {
 	defer func() {
@@ -62,7 +82,7 @@ func (c *Client) write() {
 		select {
 		case message, ok := <-c.send:
 			if !ok {
-				c.socket.WriteMessage(websocket.CloseMessage, []byte{}) // If the cannel is not alright, we'll send a message to disconnect the client
+				c.socket.WriteMessage(websocket.CloseMessage, []byte{}) 
 				return
 			}
 
@@ -72,64 +92,208 @@ func (c *Client) write() {
 }
 
 type Message struct {
-	Sender    string `json:"sender,omitempty"`
-	Recipient string `json:"recipient,omitempty"`
-	Content   string `json:"content,omitempty"`
+	ID        	primitive.ObjectID 	`json:"_id,omitempty" bson:"_id,omitempty"`
+	Sender    	string             	`json:"sender,omitempty" bson:"sender,omitempty"`
+	Recipient 	string             	`json:"recipient,omitempty" bson:"recipient,omitempty"`
+	Content   	string             	`json:"content,omitempty" bson:"content,omitempty"`
+	Timestamp 	time.Time          	`json:"timestamp,omitempty" bson:"timestamp,omitempty"`
+}
+
+type User struct {
+	Username   string            `json:"username,omitempty" bson:"username,omitempty"` 
+}
+
+func connectToMongoDB(ctx context.Context, mongoURI string) (*mongo.Client, error) {
+	clientOptions := options.Client().ApplyURI(mongoURI)
+	client, err := mongo.Connect(ctx, clientOptions)
+	if err != nil {
+		return nil, err
+	}
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	log.Println("Connected to MongoDB!")
+	return client, nil
+}
+
+func sendMessageToDB(client *mongo.Client, message Message) error {
+	collection := client.Database("chat").Collection("messages")
+	message.Timestamp = time.Now()
+	_, err := collection.InsertOne(context.Background(), message)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 var manager = ClientManager{
 	broadcast:  make(chan []byte),
 	register:   make(chan *Client),
 	unregister: make(chan *Client),
-	clients:    make(map[*Client]bool),
+	clients:    make(map[string]*Client),
 }
 
 func (manager *ClientManager) start() {
 	for {
 		select {
-		case conn := <-manager.register: // In case som client wants to connect to the service, the manager.register will get its data
-			manager.clients[conn] = true // Then the client will be set to active in the manager's Client pool
-			jsonMessage, _ := json.Marshal(&Message{Content: "/A new socket has connected."})
-			manager.send(jsonMessage, conn) // A message is sent to all the other clients connected
-		case conn := <-manager.unregister: // In case some client unregisters, the manager will get its data as well
-			if _, ok := manager.clients[conn]; ok { // Check if the client does exist in the pool
-				close(conn.send)              // The channel data is closed
-				delete(manager.clients, conn) // The client is deleted from the service
-				jsonMessage, _ := json.Marshal(&Message{Content: "/A socket has disconnected."})
-				manager.send(jsonMessage, conn) // A message is sent to all the other clients connected
+		case conn := <-manager.register:
+			manager.clients[conn.Username] = conn
+			log.Println("User ", conn.Username, " connected")
+		case conn := <-manager.unregister: 
+			if _, ok := manager.clients[conn.Username]; ok { 
+				close(conn.send)              
+				delete(manager.clients, conn.Username)
 			}
-		case message := <-manager.broadcast: // If the broadcast has data in it, some client is trying to send/receive data
-			for conn := range manager.clients { // The we send the data to each connected client
-				select {
-				case conn.send <- message: // We insert the message into each client's "mailbox"
-				default: // If the message can't be sent, the client is considered dead, so it'll be deleted
-					close(conn.send)
-					delete(manager.clients, conn)
-				}
+		case message := <-manager.broadcast:
+			var msg Message
+			err := json.Unmarshal(message, &msg)
+			if err != nil {
+				log.Println("Error decoding message: ", err)
+				continue
 			}
+			manager.send(message, msg.Recipient)
 		}
 	}
 }
 
+func getMessagesfromDB(client *mongo.Client, username, receiver string) ([]Message, error) {
+	collection := client.Database("chat").Collection("messages")
+
+	filter := bson.M{
+		"$or": []bson.M{
+			{"sender": username, "recipient": receiver},
+			{"sender": receiver, "recipient": username},
+		},
+	}
+	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: 1}})
+	cursor, err := collection.Find(context.Background(), filter, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+
+	var messages []Message
+	for cursor.Next(context.Background()) {
+		var msg Message
+		if err := cursor.Decode(&msg); err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+	
+	return messages, nil
+}
+
+func getChatsFromFB(client *mongo.Client, username string) ([]map[string]string, error) {
+	collection := client.Database("chat").Collection("messages")
+
+	filter := bson.M{
+		"$or": []bson.M{
+			{"sender": username},
+			{"recipient": username},
+		},
+	}
+
+	cursor, err := collection.Find(context.Background(), filter)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+
+	usersMap := make(map[string]bool)
+	for cursor.Next(context.Background()) {
+		var msg Message
+		if err := cursor.Decode(&msg); err != nil {
+			return nil, err
+		}
+		if msg.Sender != username {
+			usersMap[msg.Sender] = true
+		}
+		if msg.Recipient != username {
+			usersMap[msg.Recipient] = true
+		}
+	}
+
+	var users []map[string]string
+	for user:= range usersMap {
+		chat := map[string]string{"username":user}
+		users = append(users, chat)
+	}
+	
+	return users, nil
+}
+
+func history(res http.ResponseWriter, req *http.Request) {
+
+	username := req.URL.Query().Get("username")
+	receiver := req.URL.Query().Get("receiver")
+	messages, err := getMessagesfromDB(manager.dbClient, username, receiver)
+	if err != nil {
+		log.Println("Error fetching the data fomr the database", err)
+		http.Error(res, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	res.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(res).Encode(messages)
+}
+
+func chats(res http.ResponseWriter, req *http.Request) {
+	username := req.URL.Query().Get("username")
+	chats, err := getChatsFromFB(manager.dbClient, username)
+	if err != nil {
+		log.Println("Error fetching the data fomr the database", err)
+		http.Error(res, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	res.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(res).Encode(chats)
+}
+
 func wsPage(res http.ResponseWriter, req *http.Request) {
-	// The http request is upgraded to a websocket request, checkOrigin solves possible CORS errors
+	
 	conn, error := (&websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}).Upgrade(res, req, nil)
 	if error != nil {
 		http.NotFound(res, req)
 		return
 	}
-	// When a connection is made, a client with a unique id is created (using uuid) and registered
-	client := &Client{id: uuid.NewV4().String(), socket: conn, send: make(chan []byte)}
+
+	username := req.URL.Query().Get("username")
+	if username == "" {
+		username = "Anonymous"
+	}
+	
+	client := &Client{id: uuid.NewV4().String(), socket: conn, send: make(chan []byte), Username: username}
 
 	manager.register <- client
-	// Then the read an write goroutines are triggered
-	go client.read()
+	
+	go client.read(&manager)
 	go client.write()
 }
 
 func main() {
 	fmt.Println("Starting application...")
+	ctx := context.Background()
+	dbClient, err := connectToMongoDB(ctx, "mongodb://localhost:27017")
+	if err != nil {
+		log.Fatal("Failed to connect to MongoDB", err)
+	}
+	defer dbClient.Disconnect(ctx)
+	manager.dbClient= dbClient
+	
 	go manager.start()
-	http.HandleFunc("/ws", wsPage)
-	http.ListenAndServe(":12345", nil)
+
+	corsHandler := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders: []string{"Content-Type"},
+	})
+	router := http.NewServeMux()
+
+	router.HandleFunc("/ws", wsPage)
+	router.HandleFunc("/history", history)
+	router.HandleFunc("/chats", chats)
+
+	handler := corsHandler.Handler(router)
+	http.ListenAndServe(":12345", handler)		// A websocket connection can be stablished via: ws://localhost:12345/ws
 }
