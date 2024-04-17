@@ -1,5 +1,5 @@
 ## Go Real Time Chat
-A chat web project
+A web chat project using websockets
 ## About the project
 This project consists on a web page running in the **React** framework, the components are built using the **typescript** language, the backend is built using the **Go** language, and the messages are distributed using the **weboscket** technology.
 
